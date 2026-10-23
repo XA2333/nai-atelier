@@ -686,3 +686,43 @@ it.each([
   await waitFor(() => expect(visibleIds()).toEqual([1, 2]));
   expect(screen.queryByText(status)).toBeNull();
 });
+
+it('搜索框里未提交的草稿不阻断追加，追加仍按已生效条件接续当前结果', async () => {
+  const observers: Array<(entries: Array<{ isIntersecting: boolean }>) => void> = [];
+  vi.stubGlobal('IntersectionObserver', class {
+    constructor(callback: (entries: Array<{ isIntersecting: boolean }>) => void) { observers.push(callback); }
+    observe() {} disconnect() {}
+  });
+  const nextPage = { ...works[1], id: 9, title: '合成作品 9' };
+  mocks.search.mockImplementation(async options => ({ items: options.page === 1 ? works : options.page === 2 ? [nextPage] : [], total: 120, page: options.page, page_size: 60 }));
+  await setup('portrait');
+  fireEvent.change(screen.getByPlaceholderText('作品、作者、标题或标签，回车检索'), { target: { value: '未提交草稿' } });
+
+  await act(async () => { observers.at(-1)?.([{ isIntersecting: true }]); });
+  await screen.findByRole('button', { name: '查看作品 合成作品 9' });
+  expect(mocks.search.mock.calls.every(([options]) => options.q === '')).toBe(true);
+});
+
+it('待补齐元数据的作品超过一页时，第一批完成后继续轮询其余作品直到全部出现', async () => {
+  const full = promptWorks(Array.from({ length: 70 }, (_, index) => `artist:synthetic ${index + 1}, 1girl`));
+  const listed = full.map(work => ({ ...work, firstImage: undefined, first_image: undefined, localFirstImageUrl: undefined, local_cover_url: undefined }));
+  mocks.search.mockImplementation(async options => ({ items: options.page === 1 ? listed : [], total: 70, page: options.page, page_size: 60 }));
+  const waits: Array<{ ids: number[]; resolve: (value: { items: AitagWorkSummary[] }) => void }> = [];
+  mocks.waitForFirstImageCache.mockImplementation(options => new Promise(resolve => { waits.push({ ids: options.ids, resolve }); }));
+  await setup('portrait');
+  const callsBeforeFilter = waits.length;
+  fireEvent.click(screen.getByRole('button', { name: '筛选' }));
+  fireEvent.change(screen.getByLabelText('画师串'), { target: { value: 'with' } });
+
+  await waitFor(() => expect(waits.length).toBeGreaterThan(callsBeforeFilter));
+  const firstBatch = waits.at(-1)!;
+  expect(firstBatch.ids).toEqual(full.slice(0, 60).map(work => work.id));
+  await act(async () => { firstBatch.resolve({ items: full.slice(0, 60).map(work => ({ ...work, localFirstImageUrl: `/synthetic/${work.id}.png` })) }); });
+
+  await waitFor(() => expect(waits.at(-1)!.ids).toEqual(full.slice(60).map(work => work.id)));
+  expect(visibleIds()).toHaveLength(60);
+  expect(screen.getAllByText('正在读取 10 个作品的元数据').length).toBeGreaterThan(0);
+  await act(async () => { waits.at(-1)!.resolve({ items: full.slice(60).map(work => ({ ...work, localFirstImageUrl: `/synthetic/${work.id}.png` })) }); });
+  await waitFor(() => expect(visibleIds()).toHaveLength(70));
+});
+

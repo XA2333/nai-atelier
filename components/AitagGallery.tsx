@@ -415,6 +415,11 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
     metadataFilterActive && isAitagMetadataPending(work) && !metadataGiveUpIds.has(Number(work.id))
   );
   const pendingMetadataItems = metadataFilterActive ? items.filter(isWorkMetadataPending) : [];
+  // 轮询循环跨多批运行，从这里读取最新的待补齐作品，补入尚未轮询的部分。
+  const pendingMetadataIdsRef = useRef<number[]>([]);
+  useEffect(() => {
+    pendingMetadataIdsRef.current = pendingMetadataItems.map(item => Number(item.id)).filter(Number.isFinite);
+  });
   // 裸画师名需要词库识别；只在启用画师串筛选时读取一次，读取前先按 artist: 等显式前缀判断。
   useEffect(() => {
     if (artistFilter === 'all' || knownArtists) return;
@@ -587,7 +592,9 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
   // 把 JSON 往返从滚动路径上移走。签名与页码都匹配才可消费，过期预取自然作废。
   const prefetchedPageRef = useRef<{ signature: string; page: number; promise: Promise<any> } | null>(null);
 
-  const getQuerySignature = () => buildAitagQuerySignature(q, prompt, sort, rankMonth, cacheFilter);
+  // 签名使用已生效的关键词与提示词：输入框里尚未提交的草稿不影响当前结果的追加加载。
+  const getQuerySignature = () => buildAitagQuerySignature(appliedQ, appliedPrompt, sort, rankMonth, cacheFilter);
+  const appliedRemotePrompt = useMemo(() => parseAitagPromptQuery(appliedPrompt).remote, [appliedPrompt]);
   const appendNextPage = async (force = false) => {
     if (appendingRef.current || isLoading) return;
     if (!force && visibleItems.length >= AITAG_APPEND_LIMIT) return;
@@ -664,9 +671,13 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
     const targetRankMonth = options.rankMonthOverride || rankMonth;
     const targetTimeRange = getAitagTimeRange(targetSort, targetRankMonth);
     const targetCacheFilter = options.cacheFilterOverride || cacheFilter;
-    const targetQ = options.qOverride ?? q;
-    const targetPrompt = options.promptOverride ?? prompt;
-    const targetRemotePrompt = options.promptOverride === undefined ? remotePrompt : parseAitagPromptQuery(targetPrompt).remote;
+    // 追加、静默刷新沿用已生效条件接续当前结果；主动检索才提交输入框里的草稿。
+    const keepAppliedQuery = isAppend || options.silent === true;
+    const targetQ = options.qOverride ?? (keepAppliedQuery ? appliedQ : q);
+    const targetPrompt = options.promptOverride ?? (keepAppliedQuery ? appliedPrompt : prompt);
+    const targetRemotePrompt = options.promptOverride !== undefined
+      ? parseAitagPromptQuery(targetPrompt).remote
+      : keepAppliedQuery ? appliedRemotePrompt : remotePrompt;
     // 签名按本次实际条件生成：覆盖值在下一次渲染才进入状态，旧值签名会让后续追加全部被丢弃。
     const prefetchSignature = buildAitagQuerySignature(targetQ, targetPrompt, targetSort, targetRankMonth, targetCacheFilter);
     if (!options.silent) setIsLoading(true);
@@ -833,8 +844,8 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
     const data = await aitagService.searchCache({
       page,
       pageSize: PAGE_SIZE,
-      q,
-      prompt: remotePrompt,
+      q: appliedQ,
+      prompt: appliedRemotePrompt,
       sort,
       cacheFilter,
       timeRange: getAitagTimeRange(sort, rankMonth),
@@ -889,21 +900,38 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
     let pollRounds = 0;
     let cancelIdleDelay = () => {};
     const controller = new AbortController();
-    // 被筛选暂时隐藏、等待元数据的作品优先轮询（接口单次最多一页），补齐后才能按条件显示。
-    const metadataWaitIds = new Set(pendingMetadataItems.slice(0, PAGE_SIZE).map(item => Number(item.id)).filter(Number.isFinite));
-    const pendingIds = new Set([
-      ...metadataWaitIds,
-      ...visibleItems.filter(needsFirstImageCacheRefresh).map(item => Number(item.id)).filter(Number.isFinite),
-    ].slice(0, PAGE_SIZE));
-    const startedAt = Date.now();
-    const keepWaitingForMetadata = () => Date.now() - startedAt < METADATA_WAIT_MS && [...metadataWaitIds].some(id => pendingIds.has(id));
-    const giveUpRemainingMetadata = () => {
-      const remaining = [...metadataWaitIds].filter(id => pendingIds.has(id));
-      if (!cancelled && remaining.length) setMetadataGiveUpIds(previous => new Set([...previous, ...remaining]));
+    // 被筛选暂时隐藏、等待元数据的作品优先轮询。接口单次最多一页，每批有结果后从最新列表补入
+    // 尚未轮询的作品，超过一页的待补齐作品也会依次轮到；等待上限按作品各自计算。
+    const metadataWaitIds = new Set<number>();
+    const metadataWaitStartedAt = new Map<number, number>();
+    const pendingIds = new Set<number>();
+    const refillMetadataWaits = () => {
+      for (const id of pendingMetadataIdsRef.current) {
+        if (pendingIds.size >= PAGE_SIZE) break;
+        if (metadataWaitIds.has(id)) continue;
+        metadataWaitIds.add(id);
+        metadataWaitStartedAt.set(id, Date.now());
+        pendingIds.add(id);
+      }
     };
+    refillMetadataWaits();
+    for (const item of visibleItems) {
+      if (pendingIds.size >= PAGE_SIZE) break;
+      const id = Number(item.id);
+      if (Number.isFinite(id) && needsFirstImageCacheRefresh(item)) pendingIds.add(id);
+    }
+    const hasMetadataWaits = () => [...pendingIds].some(id => metadataWaitIds.has(id));
+    const giveUpMetadata = (ids: number[]) => {
+      ids.forEach(id => pendingIds.delete(id));
+      if (!cancelled && ids.length) setMetadataGiveUpIds(previous => new Set([...previous, ...ids]));
+    };
+    const expireMetadataWaits = () => giveUpMetadata([...pendingIds].filter(id => (
+      metadataWaitIds.has(id) && Date.now() - (metadataWaitStartedAt.get(id) ?? 0) >= METADATA_WAIT_MS
+    )));
+    const giveUpRemainingMetadata = () => giveUpMetadata([...pendingIds].filter(id => metadataWaitIds.has(id)));
 
     const waitForFirstImages = async () => {
-      while (!cancelled && pendingIds.size > 0 && (pollRounds < 4 || keepWaitingForMetadata())) {
+      while (!cancelled && pendingIds.size > 0 && (pollRounds < 4 || hasMetadataWaits())) {
         pollRounds++;
         try {
           const data = await aitagService.waitForFirstImageCache({
@@ -920,6 +948,8 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
             idleRounds = 0;
             nextItems.forEach(item => pendingIds.delete(Number(item.id)));
             mergeCachedFirstImageItems(nextItems);
+            // 已有首图缓存却仍缺元数据的作品无法再等到结果，按无法判断处理，不占用待补齐名额。
+            giveUpMetadata(nextItems.filter(isAitagMetadataPending).map(item => Number(item.id)).filter(id => metadataWaitIds.has(id)));
             if (data.status) {
               setCacheStatus(data.status);
               aitagPageCache = { ...aitagPageCache, cacheStatus: data.status };
@@ -928,7 +958,7 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
             }
           } else {
             if (idleRounds >= FIRST_IMAGE_IDLE_DELAYS_MS.length) {
-              if (keepWaitingForMetadata()) {
+              if (hasMetadataWaits()) {
                 // 后端仍在逐个补齐：沿用最长间隔继续等待，不提前放弃隐藏的作品。
                 idleRounds = FIRST_IMAGE_IDLE_DELAYS_MS.length - 1;
               } else {
@@ -952,6 +982,8 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
             });
             cancelIdleDelay = () => {};
           }
+          expireMetadataWaits();
+          refillMetadataWaits();
         } catch (e) {
           if (cancelled) return;
           await refreshCurrentPageFromCache().catch(console.error);
@@ -970,7 +1002,7 @@ export const AitagGallery: React.FC<AitagGalleryProps> = ({ active, selectionFoc
       cancelIdleDelay();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, q, prompt, sort, rankMonth, cacheFilter, isLoading, isOfflineCache, hasPendingFirstImageCache, metadataFilterActive, allowBackgroundChecks]);
+  }, [page, appliedQ, appliedPrompt, sort, rankMonth, cacheFilter, isLoading, isOfflineCache, hasPendingFirstImageCache, metadataFilterActive, allowBackgroundChecks]);
 
   useEffect(() => {
     if (!allowBackgroundChecks || !selectedId || !selectedDetail || selectedDetail.isPreviewOnly || detailHasFullyCachedImages(selectedDetail)) return;
