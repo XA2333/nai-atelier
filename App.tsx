@@ -1019,6 +1019,7 @@ const App = () => {
           onNavigateToPlayground={() => handleNavigate('playground', undefined, { externalImport: true })}
           onCreateArtistChain={handleCreateChainFromAitag}
           onRefreshInspiration={() => loadInspirations(true)}
+          chains={chains}
         />;
       case 'danbooru':
         return <DanbooruGallery
