@@ -6,6 +6,9 @@ import { ImageActivityContext, SmartImage } from './SmartImage';
 import type { ArtistSampleGeneration } from '../services/artistSampleGeneration';
 import { IMAGE_CARD_ACTION_CLASS, ImageShareActions } from './ImageShareActions';
 import { ImageCardActions } from './ImageCardActions';
+import { buildArtistReferenceImageUrl, type ArtistReferenceImage } from '../services/artistReference';
+
+export interface ArtistReferenceCoverImage extends ArtistReferenceImage { entryId: string; index: number }
 
 export const ArtistSampleCover: React.FC<{
   generation?: ArtistSampleGeneration;
@@ -16,6 +19,9 @@ export const ArtistSampleCover: React.FC<{
   revision: string;
   hasPackSample: boolean;
   ownSamples: ArtistOwnSample[];
+  /** 画师组串参考的 V5 来源例图，排在自建样张与图包之后。 */
+  referenceImages?: ArtistReferenceCoverImage[];
+  referenceSource?: { url: string; version: string };
   alt: string;
   imageClassName?: string;
   onPackChange: (pack: ArtistSamplePack) => void;
@@ -24,7 +30,7 @@ export const ArtistSampleCover: React.FC<{
   notify: (message: string, type?: 'success' | 'error') => void;
   onFavoriteChange?: (active: boolean) => void;
   onImageLoad?: (width: number, height: number) => void;
-}> = ({ generation, pending = false, onGenerate, tag, pack, revision, hasPackSample, ownSamples, alt, imageClassName, onPackChange, sampleStatusText, onSupplement, notify, onFavoriteChange, onImageLoad }) => {
+}> = ({ generation, pending = false, onGenerate, tag, pack, revision, hasPackSample, ownSamples, referenceImages = [], referenceSource, alt, imageClassName, onPackChange, sampleStatusText, onSupplement, notify, onFavoriteChange, onImageLoad }) => {
   useLanguage();
   const active = useContext(ImageActivityContext);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -34,7 +40,7 @@ export const ArtistSampleCover: React.FC<{
   const [imageError, setImageError] = useState(false);
   const [index, setIndex] = useState(0);
   const [retry, setRetry] = useState(0);
-  const identity = JSON.stringify([pack, tag, revision, ownSamples.map(sample => sample.id)]);
+  const identity = JSON.stringify([pack, tag, revision, ownSamples.map(sample => sample.id), referenceImages.map(image => image.thumb)]);
   const lookup = lookupResult?.identity === identity ? lookupResult.data : undefined;
   useEffect(() => {
     setLookupResult(undefined); setError(''); setImageError(false); setIndex(0);
@@ -60,31 +66,40 @@ export const ArtistSampleCover: React.FC<{
   }, [active, visible, hasPackSample, identity, retry, lookup]);
   const own = ownSamples[index];
   const packIndex = index - ownSamples.length;
-  const imageUrl = own?.imageUrl || (lookup && packIndex >= 0 && packIndex < lookup.imageCount ? buildArtistSampleImageUrl(pack, tag, packIndex, lookup.revision) : '');
+  // 图包查询返回前不显示例图，避免先露出例图再被图包样张替换。
+  const packPending = hasPackSample && !lookup && !error;
+  const packCount = lookup?.imageCount || 0;
+  const reference = !own && !packPending && packIndex >= packCount ? referenceImages[packIndex - packCount] : undefined;
+  const imageUrl = own?.imageUrl || (lookup && packIndex >= 0 && packIndex < lookup.imageCount ? buildArtistSampleImageUrl(pack, tag, packIndex, lookup.revision) : '') || (reference ? buildArtistReferenceImageUrl(reference.thumb) : '');
+  const shareUrl = reference ? buildArtistReferenceImageUrl(reference.full) : imageUrl;
   const preview = generation?.session?.preview?.image || (generation?.phase === 'save_failed' || generation?.phase === 'saving' ? generation.item?.imageUrl : generation?.phase === 'failed' ? generation.preview : undefined);
-  const total = ownSamples.length + (lookup?.imageCount || 0);
+  const total = ownSamples.length + packCount + (packPending ? 0 : referenceImages.length);
   const sampleRevision = own?.id || lookup?.revision || revision;
-  const favorite = { imageUrl, title: alt || tag, sourceType: 'artist' as const, sourceId: tag,
+  const favorite = reference ? { imageUrl: shareUrl, title: alt || tag, sourceType: 'artist' as const, sourceId: tag,
+    imageId: JSON.stringify([pack, 'reference', reference.entryId, reference.index]), sourceUrl: referenceSource?.url,
+    analysis: { artistReference: { entryId: reference.entryId, file: reference.full, version: referenceSource?.version || '' } },
+  } : { imageUrl, title: alt || tag, sourceType: 'artist' as const, sourceId: tag,
     imageId: JSON.stringify([pack, sampleRevision, tag, own ? 0 : packIndex]), sourceUrl: own ? undefined : lookup?.sourceUrl,
     prompt: own?.prompt, negativePrompt: own?.negativePrompt, params: own?.params,
     analysis: { artistSample: { pack, tag, revision: sampleRevision, index: own ? 0 : packIndex, ...(own ? { ownSampleId: own.id, model: own.params.model } : {}) } },
   };
-  const filename = `artist-${pack}-${tag}-${own?.id || packIndex}.png`;
+  const filename = reference ? `artist-${pack}-${tag}-reference-${reference.entryId}.${reference.full.split('.').pop()}` : `artist-${pack}-${tag}-${own?.id || packIndex}.png`;
   const move = (direction: number) => { setIndex(current => Math.max(0, Math.min(total - 1, current + direction))); setImageError(false); };
   const stopCardAction = (event: React.SyntheticEvent) => event.stopPropagation();
   const nextPack = pack === 'v45' ? 'v5' : 'v45';
   const switchLabel = t('样张版本 {0}，切换为 {1}', [pack === 'v45' ? 'V4.5' : 'V5', nextPack === 'v45' ? 'V4.5' : 'V5']);
-  const missing = (!hasPackSample || lookup?.imageCount === 0) && ownSamples.length === 0;
+  const missing = (!hasPackSample || lookup?.imageCount === 0) && ownSamples.length === 0 && referenceImages.length === 0;
   return <div ref={rootRef} className="absolute inset-0">
     <div data-card-action="true" data-image-action-left className="absolute left-2 top-2 z-20 flex flex-col items-start gap-1" onClick={stopCardAction} onPointerDown={stopCardAction} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') event.stopPropagation(); }}>
       <button type="button" aria-label={switchLabel} title={switchLabel} onClick={() => onPackChange(nextPack)} className="mobile-touch mobile-size-locked inline-flex h-11 min-w-11 items-center justify-center gap-1 rounded-full border border-white/50 bg-black/55 px-2 text-white backdrop-blur hover:bg-black/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white md:h-8 [@media(any-pointer:coarse)]:min-h-11"><span className="text-meta font-bold leading-none">{pack === 'v45' ? 'V4.5' : 'V5'}</span><ArrowLeftRight className="h-2.5 w-2.5" /></button>
     </div>
     {imageUrl && !imageError ? <>
       <SmartImage key={`${imageUrl}:${retry}`} src={imageUrl} alt={alt} eager={visible} className={imageClassName} previewTransform={!own && imageUrl.startsWith('/api/artist-samples/image?') ? 'artist-sample-padding-v1' : undefined} onError={() => setImageError(true)} onLoad={event => { if (event.currentTarget.naturalWidth && event.currentTarget.naturalHeight) onImageLoad?.(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight); }} />
-      {!preview && <ImageCardActions><ImageShareActions variant="card" imageUrl={imageUrl} filename={filename} favorite={favorite} notify={notify} onFavoriteChange={onFavoriteChange} />
+      {!preview && <ImageCardActions><ImageShareActions variant="card" imageUrl={shareUrl} filename={filename} favorite={favorite} notify={notify} onFavoriteChange={onFavoriteChange} />
         {onGenerate && generation?.phase !== 'save_failed' && <button type="button" data-card-action="true" data-agent-action="business" title={t(own ? '重新生成样张' : '生成样张')} aria-label={t(own ? '重新生成样张' : '生成样张')} disabled={pending} onClick={event => { event.stopPropagation(); onGenerate(); }} onPointerDown={stopCardAction} onKeyDown={stopCardAction} className={`${IMAGE_CARD_ACTION_CLASS} hover-reveal-md inline-flex shrink-0 items-center justify-center disabled:opacity-40`}><RefreshCw className="h-4 w-4" /></button>}
       </ImageCardActions>}
       {own && <span className="pointer-events-none absolute bottom-14 left-2 rounded-full bg-black/60 px-2 py-1 text-mini font-bold text-white backdrop-blur">{t('自建样张')}</span>}
+      {reference && <span className="pointer-events-none absolute bottom-14 left-2 rounded-full bg-black/60 px-2 py-1 text-mini font-bold text-white backdrop-blur">{t('来源例图')}</span>}
       {total > 1 && <>
         <button data-card-action="true" type="button" aria-label={t('上一张')} disabled={index === 0} onClick={event => { event.stopPropagation(); move(-1); }} className="gallery-cover-navigation hover-reveal-touch mobile-touch absolute bottom-2 left-2 rounded-full bg-black/65 p-2 text-white backdrop-blur disabled:opacity-35"><ChevronLeft className="h-4 w-4" /></button>
         <button data-card-action="true" type="button" aria-label={t('下一张')} disabled={index >= total - 1} onClick={event => { event.stopPropagation(); move(1); }} className="gallery-cover-navigation hover-reveal-touch mobile-touch absolute bottom-2 right-2 rounded-full bg-black/65 p-2 text-white backdrop-blur disabled:opacity-35"><ChevronRight className="h-4 w-4" /></button>

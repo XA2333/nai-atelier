@@ -158,3 +158,34 @@ it('有图的生成入口共用右侧小圆形操作样式，图包和自建区�
   expect(screen.queryByRole('button', { name: '生成样张' })).toBeNull();
   expect(screen.getAllByRole('button', { name: '补充样张' })).toHaveLength(1);
 });
+
+it('V5 来源例图排在图包样张之后，卡片用缩略图，收藏与下载取原图并标明来源', async () => {
+  mocks.lookup.mockResolvedValue({ pack: 'v5', tag: 'synthetic artist', revision: 'one', imageCount: 1, sourceUrl: 'https://synthetic.invalid/pack' });
+  const props = { tag: 'synthetic artist', pack: 'v5' as const, revision: 'one', hasPackSample: true, ownSamples: [], alt: '合成画师', onPackChange: vi.fn(), onSupplement: vi.fn(), notify: vi.fn(),
+    referenceImages: [{ entryId: 'entry_1', index: 0, full: 'images/entry_1.webp', thumb: 'thumbs/entry_1.webp' }], referenceSource: { url: 'https://reference.invalid', version: '4:1' } };
+  render(<ArtistSampleCover {...props} />);
+  // 图包查询返回前不先露出例图，避免随后被图包样张替换。
+  expect(screen.queryByRole('img')).toBeNull();
+  visible(); await screen.findByRole('img');
+  expect(screen.getByRole('img').getAttribute('src')).toContain('/api/artist-samples/image?');
+  expect(screen.queryByText('来源例图')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: '下一张' }));
+  expect(screen.getByRole('img').getAttribute('src')).toBe('/api/artist-reference/image?file=thumbs%2Fentry_1.webp');
+  expect(screen.getByRole('img').getAttribute('data-preview-transform')).toBeNull();
+  expect(screen.getByText('来源例图')).toBeTruthy();
+  const share = mocks.share.mock.calls.at(-1)![0];
+  expect(share.imageUrl).toBe('/api/artist-reference/image?file=images%2Fentry_1.webp');
+  expect(share.filename).toBe('artist-v5-synthetic artist-reference-entry_1.webp');
+  expect(share.favorite).toMatchObject({ sourceType: 'artist', sourceId: 'synthetic artist', sourceUrl: 'https://reference.invalid', analysis: { artistReference: { entryId: 'entry_1', file: 'images/entry_1.webp', version: '4:1' } } });
+  expect(share.favorite.imageId).toBe(JSON.stringify(['v5', 'reference', 'entry_1', 0]));
+  expect(screen.getByRole('button', { name: '下一张' }).hasAttribute('disabled')).toBe(true);
+});
+
+it('图包没有这位画师时直接显示来源例图，不再提示补充样张', async () => {
+  const props = { tag: 'reference only', pack: 'v5' as const, revision: '', hasPackSample: false, ownSamples: [], alt: 'reference only', onPackChange: vi.fn(), onSupplement: vi.fn(), notify: vi.fn(),
+    referenceImages: [{ entryId: 'entry_2', index: 0, full: 'images/entry_2.webp', thumb: 'thumbs/entry_2.webp' }] };
+  render(<ArtistSampleCover {...props} />);
+  expect(screen.getByRole('img').getAttribute('src')).toBe('/api/artist-reference/image?file=thumbs%2Fentry_2.webp');
+  expect(screen.queryByRole('button', { name: '补充样张' })).toBeNull();
+  expect(mocks.lookup).not.toHaveBeenCalled();
+});
